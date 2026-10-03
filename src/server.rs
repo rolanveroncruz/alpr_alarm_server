@@ -5,14 +5,14 @@ use axum::{
     extract::State,
     http::{header, StatusCode},
     response::IntoResponse,
-    routing::{get},
+    routing::{get, post},
     Json, Router,
 };
-
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
@@ -37,12 +37,16 @@ struct AlprPayload {
 pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from("out");
 
-    // Create the output directory if necessary.
+    // -----------------------------------------
+    // 1. Create the output directory if necessary.
+    // -----------------------------------------
     std::fs::create_dir_all(&out_dir)?;
 
     let db_path = out_dir.join("alpr_events.db");
 
-    // Initialize the database.
+    // ------------------------
+    // 2. Initialize the database.
+    // ------------------------
     initialize_database(&db_path)?;
 
     let state = AppState {
@@ -50,17 +54,19 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         out_dir,
     };
 
+    // -----------------------
+    // 3. Setup axum server
+    // -----------------------
+
     let app = Router::new()
-        .route(
-            "/api/alpr",
-            get(get_alpr_events).post(alpr_webhook_handler),
-        )
+        .route("/api/alpr/event", post(alpr_webhook_handler))
+        .route( "/api/alpr/events", get(get_alpr_events))
         .fallback(fallback_handler)
         .with_state(state);
 
     println!("Alarm server listening on http://0.0.0.0:3000");
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 
     axum::serve(listener, app).await?;
 
@@ -77,7 +83,7 @@ fn initialize_database(
     connection.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS alpr_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT PRIMARY KEY NOT NULL,
             camid TEXT NOT NULL,
             date TEXT NOT NULL,
             plate TEXT NOT NULL,
@@ -99,7 +105,10 @@ async fn alpr_webhook_handler(
 ) -> impl IntoResponse {
     println!("\n=== Incoming ALPR Trigger from VIGI ===");
 
-    // Decode the JSON payload.
+    // ---------------------------
+    // 1. Decode the JSON payload.
+    // ---------------------------
+
     let payload: AlprPayload = match serde_json::from_slice(&body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -112,10 +121,10 @@ async fn alpr_webhook_handler(
     println!("Plate:  {}", payload.plate);
     println!("Date:   {}", payload.date);
 
-    // Use the SQLite ID as the eventual event identifier.
-    //
-    // We first insert the event, then use its ID to create stable
-    // image filenames.
+
+    // ---------------------------------
+    // 2. Open a connection with sqlite
+    // ---------------------------------
     let connection = match Connection::open(&state.db_path) {
         Ok(connection) => connection,
         Err(error) => {
@@ -124,133 +133,118 @@ async fn alpr_webhook_handler(
         }
     };
 
-    let result = connection.execute(
-        r#"
-        INSERT INTO alpr_events
-            (camid, date, plate, image, plate_image)
-        VALUES
-            (?1, ?2, ?3, ?4, ?5)
-        "#,
-        params![
-            payload.camid,
-            payload.date,
-            payload.plate,
-            "",
-            "",
-        ],
-    );
+    // --------------------------------------
+    // 3. Generate a unique ID for this event
+    // --------------------------------------
+    let event_id = Uuid::new_v4().to_string();
 
-    let event_id = match result {
-        Ok(_) => connection.last_insert_rowid(),
+
+    // ----------------------------------------------
+    // 4. Decode and save the event images into files.
+    // ----------------------------------------------
+
+    let (image_filename, plate_filename) = match decode_and_save_images_to_files(&state, &event_id, &payload.image, &payload.plate_image){
+        Ok(filenames)=>filenames,
         Err(error) => {
-            eprintln!("Failed to insert ALPR event: {}", error);
+            eprintln!("Failed to save  images:{}", error);
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
 
-    // Decode the scene image.
-    let image_bytes = match STANDARD.decode(&payload.image) {
+    // ------------------------------------
+    // 5. Insert the event into SQLite
+    // ------------------------------------
+    let result = connection.execute(
+        r#"
+        INSERT INTO alpr_events
+            (id,camid, date, plate, image, plate_image)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+        params![
+            event_id,
+            payload.camid,
+            payload.date,
+            payload.plate,
+            image_filename,
+            plate_filename,
+
+        ],
+    );
+    if let Err(error) = result{
+        eprintln!("Failed to insert alpr event: {}", error);
+        let _ = std::fs::remove_file(state.out_dir.join(&image_filename));
+        let _ = std::fs::remove_file(state.out_dir.join(&plate_filename));
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    StatusCode::OK
+}
+
+fn decode_and_save_images_to_files(state:&AppState,
+                                   event_id: &str,
+                                   payload_image: &str,
+                                   plate_image:  &str,
+)->Result<(String, String), std::io::Error>{
+    // ------------------------
+    // 1. Decode the scene image.
+    // -------------------------
+
+    let image_bytes = match STANDARD.decode(payload_image) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("Failed to decode scene image: {}", error);
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, error));
 
-            let _ = connection.execute(
-                "DELETE FROM alpr_events WHERE id = ?1",
-                params![event_id],
-            );
-
-            return StatusCode::BAD_REQUEST;
         }
     };
 
-    // Decode the plate image.
-    let plate_image_bytes = match STANDARD.decode(&payload.plate_image) {
+    // ------------------------
+    // 2.Decode the plate image.
+    // ------------------------
+    let plate_image_bytes = match STANDARD.decode(plate_image) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("Failed to decode plate image: {}", error);
-
-            let _ = connection.execute(
-                "DELETE FROM alpr_events WHERE id = ?1",
-                params![event_id],
-            );
-
-            return StatusCode::BAD_REQUEST;
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, error));
         }
     };
 
+    //------------------
+    // 3. Set the relevant variables.
+    //-------------------
     let image_filename = format!("event_{}.jpg", event_id);
     let plate_image_filename = format!("event_{}_plate.jpg", event_id);
 
     let image_path = state.out_dir.join(&image_filename);
     let plate_image_path = state.out_dir.join(&plate_image_filename);
 
-    // Save scene image.
+    //------------------
+    // 4. Save scene image.
+    //-------------------
     if let Err(error) = std::fs::write(&image_path, image_bytes) {
         eprintln!("Failed to save scene image: {}", error);
-
-        let _ = connection.execute(
-            "DELETE FROM alpr_events WHERE id = ?1",
-            params![event_id],
-        );
-
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, error));
     }
 
-    // Save plate image.
+    // -----------------
+    // 5. Save plate image.
+    //------------------
     if let Err(error) = std::fs::write(&plate_image_path, plate_image_bytes) {
         eprintln!("Failed to save plate image: {}", error);
 
+        // ✅ Don't leave an orphaned scene image.
         let _ = std::fs::remove_file(&image_path);
 
-        let _ = connection.execute(
-            "DELETE FROM alpr_events WHERE id = ?1",
-            params![event_id],
-        );
-
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, error));
     }
+    Ok((image_filename, plate_image_filename))
 
-    // Update the database with the image filenames.
-    if let Err(error) = connection.execute(
-        r#"
-        UPDATE alpr_events
-        SET image = ?1,
-            plate_image = ?2
-        WHERE id = ?3
-        "#,
-        params![
-            image_filename,
-            plate_image_filename,
-            event_id,
-        ],
-    ) {
-        eprintln!("Failed to update image filenames: {}", error);
-
-        let _ = std::fs::remove_file(&image_path);
-        let _ = std::fs::remove_file(&plate_image_path);
-
-        let _ = connection.execute(
-            "DELETE FROM alpr_events WHERE id = ?1",
-            params![event_id],
-        );
-
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-
-    println!(
-        "Saved event {}: {} / {}",
-        event_id,
-        image_filename,
-        plate_image_filename
-    );
-
-    StatusCode::OK
 }
-
 
 #[derive(Debug, Serialize)]
 struct AlprRecord {
-    id: i64,
+    id: String,
     camid: String,
     date: String,
     plate: String,
@@ -278,7 +272,7 @@ async fn get_alpr_events(
                 image,
                 plate_image
             FROM alpr_events
-            ORDER BY id
+            ORDER BY date DESC
             "#,
         )
         .map_err(|error| {
