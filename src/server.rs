@@ -64,7 +64,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(fallback_handler)
         .with_state(state);
 
-    println!("Alarm server listening on http://0.0.0.0:3000");
+    println!("Alarm server listening on http://127.0.0.1:3000");
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
 
