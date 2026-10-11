@@ -8,11 +8,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use axum::http::Method;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Clone)]
 struct AppState {
@@ -48,6 +50,10 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Initialize the database.
     // ------------------------
     initialize_database(&db_path)?;
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers(Any);
 
     let state = AppState {
         db_path,
@@ -62,6 +68,7 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/alpr/event", post(alpr_webhook_handler))
         .route( "/api/alpr/events", get(get_alpr_events))
         .fallback(fallback_handler)
+        .layer(cors)
         .with_state(state);
 
     println!("Alarm server listening on http://127.0.0.1:3000");
